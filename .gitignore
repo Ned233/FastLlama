@@ -1,4 +1,4 @@
-# 忽略 model 目录下的所有内容
+# 忽略
 model/
 checkpoints/
 __pycache__/
