@@ -1,0 +1,1 @@
+python run.py --layer_start 19 --layer_end 39 --block_size 512 --num_fft_matrices 4 --epochs 20
