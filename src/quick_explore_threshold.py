@@ -4,8 +4,8 @@ import time
 import numpy as np
 import json
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from src.fftchain import FFTChainMatrix
-from src.config_fftchain import get_args
+from fftchain import FFTChainMatrix
+from config_fftchain import get_args
 import gc
 
 def benchmark_single_config(linear_layer, in_features, out_features, block_size, k, 

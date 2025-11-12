@@ -5,8 +5,8 @@ import numpy as np
 import json
 import os
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from src.fftchain import FFTChainMatrix
-from src.config_fftchain import get_args
+from fftchain import FFTChainMatrix
+from config_fftchain import get_args
 import gc
 
 class LinearLayerBenchmark:

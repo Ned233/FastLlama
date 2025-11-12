@@ -2,8 +2,8 @@ import torch
 import time
 import gc
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from src.config_fftchain import get_args
-from src.utils import replace_linear_with_fftchain, load_checkpoint
+from config_fftchain import get_args
+from utils import replace_linear_with_fftchain, load_checkpoint
 import os
 import numpy as np
 
