@@ -10,10 +10,6 @@ import os
 from scipy import stats
 
 def benchmark_with_trained_checkpoint(args):
-    """
-    Test configurations that match your trained checkpoint
-    """
-    
     print("="*80)
     print("REALISTIC THRESHOLD TEST - TRAINED CHECKPOINT")
     print("="*80)
@@ -203,25 +199,25 @@ def benchmark_with_trained_checkpoint(args):
             'k': args.num_fft_matrices
         },
         'original': {
-            'mean_ms': orig_mean,
-            'std_ms': orig_std,
+            'mean_ms': float(orig_mean),
+            'std_ms': float(orig_std),
             'min_ms': float(np.min(orig_times)),
             'max_ms': float(np.max(orig_times)),
             'times': [float(t) for t in orig_times]
         },
         'fftchain': {
-            'mean_ms': fft_mean,
-            'std_ms': fft_std,
+            'mean_ms': float(fft_mean),
+            'std_ms': float(fft_std),
             'min_ms': float(np.min(fft_times)),
             'max_ms': float(np.max(fft_times)),
             'times': [float(t) for t in fft_times]
         },
-        'speedup': speedup,
-        'compression': compression,
+        'speedup': float(speedup),
+        'compression': float(compression),
         'statistical': {
             't_stat': float(t_stat),
             'p_value': float(p_value),
-            'significant': p_value < 0.05
+            'significant': bool(p_value < 0.05)
         }
     }
     
