@@ -3,15 +3,14 @@ import torch.nn as nn
 from fftchain import FFTChainMatrix
 
 def replace_linear_with_fftchain(model, layer_indices, target_matrix, block_size, num_fft_matrices):
-    """替换指定层的线性层为 FFTChain"""
     num_layers = len(model.model.layers)
-    print(f"[Replace] Model has {num_layers} layers (indices 0-{num_layers-1})")
+    print(f"Model has {num_layers} layers (indices 0-{num_layers-1})")
     
     replaced_modules = []
     
     for layer_idx in layer_indices:
         if layer_idx >= num_layers:
-            print(f"[Replace] Warning: layer {layer_idx} exceeds model layers, skipping")
+            print(f"layer {layer_idx} exceeds model layers, skipping")
             continue
         
         layer = model.model.layers[layer_idx]
@@ -28,12 +27,11 @@ def replace_linear_with_fftchain(model, layer_indices, target_matrix, block_size
         in_features = original.in_features
         out_features = original.out_features
         
-        # 修正：根据 fftchain.py 的实际参数名
         fft_module = FFTChainMatrix(
             in_features=in_features,
             out_features=out_features,
             block_size=block_size,
-            num_fft_matrices=num_fft_matrices  # 保持原参数名
+            num_fft_matrices=num_fft_matrices
         )
         
         if target_matrix == 'down_proj':
@@ -50,7 +48,6 @@ def replace_linear_with_fftchain(model, layer_indices, target_matrix, block_size
     return replaced_modules
 
 def save_checkpoint(model, optimizer, epoch, path, config=None):
-    """保存checkpoint"""
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
