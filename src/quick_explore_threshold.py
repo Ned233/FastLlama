@@ -1,248 +1,249 @@
 import torch
-import torch.nn as nn
 import time
 import numpy as np
 import json
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from fftchain import FFTChainMatrix
 from config_fftchain import get_args
+from utils import replace_linear_with_fftchain, load_checkpoint
 import gc
+import os
 
-def benchmark_single_config(linear_layer, in_features, out_features, block_size, k, 
-                            batch_size, seq_len, device, num_runs=30):
+def benchmark_with_trained_checkpoint(args):
+    """
+    Test configurations that match your trained checkpoint
+    """
     
-    fft_layer = FFTChainMatrix(
-        in_features=in_features,
-        out_features=out_features,
-        block_size=block_size,
-        num_fft_matrices=k,
-        dtype=torch.float16
-    ).to(device).to(torch.float32)
+    print("="*80)
+    print("REALISTIC THRESHOLD TEST - TRAINED CHECKPOINT")
+    print("="*80)
+    print(f"Testing configuration: L{args.layer_start}-{args.layer_end}, "
+          f"B={args.block_size}, K={args.num_fft_matrices}")
+    print()
     
-    x = torch.randn(batch_size, seq_len, in_features, device=device, dtype=torch.float16)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     
+    test_prompts = [
+        "The future of artificial intelligence is",
+        "In a world where technology advances",
+        "Scientists have recently discovered"
+    ]
+    
+    num_runs = 30
+    seq_len = 128
+    
+    print("Step 1: Benchmarking original model...")
+    print("-" * 80)
+    
+    original_model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        torch_dtype=torch.float16,
+        device_map={"": args.device}
+    )
+    original_model.eval()
+    
+    orig_times = []
     with torch.no_grad():
         for _ in range(5):
-            _ = linear_layer(x)
+            prompt = test_prompts[_ % len(test_prompts)]
+            inputs = tokenizer(prompt, return_tensors="pt", 
+                             padding='max_length', max_length=seq_len, 
+                             truncation=True).to(args.device)
+            _ = original_model(**inputs)
             torch.cuda.synchronize()
-    
-    linear_times = []
-    with torch.no_grad():
-        for _ in range(num_runs):
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            _ = linear_layer(x)
-            torch.cuda.synchronize()
-            linear_times.append((time.perf_counter() - start) * 1000)
-    
-    with torch.no_grad():
-        for _ in range(5):
-            _ = fft_layer(x)
-            torch.cuda.synchronize()
-    
-    fft_times = []
-    with torch.no_grad():
-        for _ in range(num_runs):
+            del inputs
+        
+        for run in range(num_runs):
+            prompt = test_prompts[run % len(test_prompts)]
+            inputs = tokenizer(prompt, return_tensors="pt",
+                             padding='max_length', max_length=seq_len,
+                             truncation=True).to(args.device)
+            
             torch.cuda.synchronize()
             start = time.perf_counter()
-            _ = fft_layer(x)
+            _ = original_model(**inputs)
             torch.cuda.synchronize()
-            fft_times.append((time.perf_counter() - start) * 1000)
+            orig_times.append((time.perf_counter() - start) * 1000)
+            
+            del inputs
+            
+            if (run + 1) % 10 == 0:
+                print(f"  Progress: {run+1}/{num_runs} runs")
     
-    linear_params = in_features * out_features
-    n_blocks = ((in_features + block_size - 1) // block_size)
-    m_blocks = ((out_features + block_size - 1) // block_size)
-    fft_params = k * n_blocks * m_blocks * block_size + k
+    orig_mean = np.mean(orig_times)
+    orig_std = np.std(orig_times)
     
-    del fft_layer, x
+    print(f"\nOriginal Model Results:")
+    print(f"  Mean: {orig_mean:.2f} ± {orig_std:.2f} ms")
+    print(f"  Min:  {np.min(orig_times):.2f} ms")
+    print(f"  Max:  {np.max(orig_times):.2f} ms")
+    
+    del original_model
+    gc.collect()
     torch.cuda.empty_cache()
+    time.sleep(2)
     
-    return {
-        'linear_mean': np.mean(linear_times),
-        'fft_mean': np.mean(fft_times),
-        'speedup': np.mean(linear_times) / np.mean(fft_times),
-        'linear_params': linear_params,
-        'fft_params': fft_params,
-        'compression': linear_params / fft_params
-    }
-
-def quick_explore(args):
-    print("="*80)
-    print("QUICK FFT THRESHOLD EXPLORATION")
-    print("="*80)
+    print("\nStep 2: Benchmarking FFTChain model...")
+    print("-" * 80)
     
-    model = AutoModelForCausalLM.from_pretrained(
+    fft_model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=torch.float16,
         device_map={"": args.device}
     )
     
-    test_layers = [0, 10, 19, 25, 30, 35, 39]
-    configs_to_test = [
-        {'block_size': 256, 'k': 2},
-        {'block_size': 512, 'k': 2},
-        {'block_size': 512, 'k': 4},
-        {'block_size': 1024, 'k': 2},
-        {'block_size': 1024, 'k': 4},
-        {'block_size': 1024, 'k': 8},
-        {'block_size': 2048, 'k': 2},
-        {'block_size': 2048, 'k': 4},
-    ]
+    layer_indices = list(range(args.layer_start, args.layer_end + 1))
+    replaced_modules = replace_linear_with_fftchain(
+        fft_model, layer_indices, args.target_matrix, 
+        args.block_size, args.num_fft_matrices
+    )
     
-    results = []
-    total_tests = len(test_layers) * len(configs_to_test)
-    current = 0
+    for module in replaced_modules:
+        module.to('cpu').to(torch.float32)
     
-    for layer_idx in test_layers:
-        print(f"\n{'='*80}")
-        print(f"LAYER {layer_idx}")
-        print('='*80)
+    checkpoint_name = f'fftchain_L{args.layer_start}-{args.layer_end}_{args.target_matrix}_final.pt'
+    checkpoint_path = os.path.join(args.checkpoint_dir, checkpoint_name)
+    
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint: {checkpoint_name}")
+        load_checkpoint(fft_model, None, checkpoint_path, device='cpu')
+    else:
+        print(f"Warning: No checkpoint found at {checkpoint_path}")
+        print(f"Using random initialization")
+    
+    for module in replaced_modules:
+        module.to(args.device)
+    
+    fft_model.eval()
+    
+    fft_times = []
+    with torch.no_grad():
+        for _ in range(5):
+            prompt = test_prompts[_ % len(test_prompts)]
+            inputs = tokenizer(prompt, return_tensors="pt",
+                             padding='max_length', max_length=seq_len,
+                             truncation=True).to(args.device)
+            _ = fft_model(**inputs)
+            torch.cuda.synchronize()
+            del inputs
         
-        layer = model.model.layers[layer_idx]
-        linear_down = layer.mlp.down_proj
-        in_feat = linear_down.in_features
-        out_feat = linear_down.out_features
-        
-        print(f"down_proj: {in_feat} → {out_feat}")
-        print("-"*80)
-        
-        for config in configs_to_test:
-            current += 1
-            block_size = config['block_size']
-            k = config['k']
+        for run in range(num_runs):
+            prompt = test_prompts[run % len(test_prompts)]
+            inputs = tokenizer(prompt, return_tensors="pt",
+                             padding='max_length', max_length=seq_len,
+                             truncation=True).to(args.device)
             
-            try:
-                result = benchmark_single_config(
-                    linear_down, in_feat, out_feat, block_size, k,
-                    batch_size=1, seq_len=128, device=args.device, num_runs=20
-                )
-                
-                result['layer'] = layer_idx
-                result['matrix'] = 'down_proj'
-                result['block_size'] = block_size
-                result['k'] = k
-                result['shape'] = (in_feat, out_feat)
-                
-                status = '✓' if result['speedup'] > 1.0 else '✗'
-                print(f"[{current:2d}/{total_tests}] B={block_size:4d} K={k:2d} | "
-                      f"L={result['linear_mean']:5.2f}ms F={result['fft_mean']:5.2f}ms | "
-                      f"Speedup={result['speedup']:4.2f}x {status} | "
-                      f"Comp={result['compression']:4.0f}x")
-                
-                results.append(result)
-                
-            except Exception as e:
-                print(f"[{current:2d}/{total_tests}] B={block_size:4d} K={k:2d} | Error: {e}")
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            _ = fft_model(**inputs)
+            torch.cuda.synchronize()
+            fft_times.append((time.perf_counter() - start) * 1000)
             
-            torch.cuda.empty_cache()
+            del inputs
+            
+            if (run + 1) % 10 == 0:
+                print(f"  Progress: {run+1}/{num_runs} runs")
     
-    del model
+    fft_mean = np.mean(fft_times)
+    fft_std = np.std(fft_times)
+    
+    print(f"\nFFTChain Model Results:")
+    print(f"  Mean: {fft_mean:.2f} ± {fft_std:.2f} ms")
+    print(f"  Min:  {np.min(fft_times):.2f} ms")
+    print(f"  Max:  {np.max(fft_times):.2f} ms")
+    
+    del fft_model
     gc.collect()
     torch.cuda.empty_cache()
     
-    return results
-
-def analyze_results(results):
     print("\n" + "="*80)
-    print("ANALYSIS")
+    print("RESULTS SUMMARY")
     print("="*80)
     
-    faster_configs = [r for r in results if r['speedup'] > 1.0]
+    speedup = orig_mean / fft_mean
     
-    print(f"\nOverall: {len(faster_configs)}/{len(results)} configs achieved speedup")
+    print(f"\nForward Pass:")
+    print(f"  Original:  {orig_mean:.2f} ± {orig_std:.2f} ms")
+    print(f"  FFTChain:  {fft_mean:.2f} ± {fft_std:.2f} ms")
     
-    print("\n1. Best Configs by Layer:")
-    print("-"*80)
-    layers = sorted(set(r['layer'] for r in results))
-    for layer in layers:
-        layer_results = [r for r in results if r['layer'] == layer]
-        faster = [r for r in layer_results if r['speedup'] > 1.0]
-        
-        if faster:
-            best = max(faster, key=lambda x: x['speedup'])
-            print(f"Layer {layer:2d}: B={best['block_size']:4d} K={best['k']:2d} | "
-                  f"Speedup={best['speedup']:.2f}x | Compress={best['compression']:.0f}x")
-        else:
-            print(f"Layer {layer:2d}: No speedup achieved")
+    if speedup > 1.0:
+        print(f"  Speedup:   {speedup:.2f}x ✓ FASTER")
+    else:
+        print(f"  Speedup:   {speedup:.2f}x ✗ SLOWER")
     
-    print("\n2. Block Size Performance:")
-    print("-"*80)
-    from collections import defaultdict
-    block_speedups = defaultdict(list)
-    for r in results:
-        block_speedups[r['block_size']].append(r['speedup'])
+    num_layers = args.layer_end - args.layer_start + 1
+    n_blocks = ((13824 + args.block_size - 1) // args.block_size)
+    m_blocks = ((5120 + args.block_size - 1) // args.block_size)
     
-    for block in sorted(block_speedups.keys()):
-        speedups = block_speedups[block]
-        avg = np.mean(speedups)
-        num_faster = sum(1 for s in speedups if s > 1.0)
-        print(f"Block {block:4d}: Avg={avg:4.2f}x | {num_faster}/{len(speedups)} faster")
+    linear_params = 13824 * 5120 * num_layers
+    fft_params = args.num_fft_matrices * n_blocks * m_blocks * args.block_size * num_layers
+    compression = linear_params / fft_params
     
-    print("\n3. K Value Performance:")
-    print("-"*80)
-    k_speedups = defaultdict(list)
-    for r in results:
-        k_speedups[r['k']].append(r['speedup'])
+    print(f"\nParameters:")
+    print(f"  Linear:       {linear_params/1e6:.1f}M")
+    print(f"  FFTChain:     {fft_params/1e6:.1f}M")
+    print(f"  Compression:  {compression:.0f}x")
     
-    for k in sorted(k_speedups.keys()):
-        speedups = k_speedups[k]
-        avg = np.mean(speedups)
-        num_faster = sum(1 for s in speedups if s > 1.0)
-        print(f"K={k:2d}: Avg={avg:4.2f}x | {num_faster}/{len(speedups)} faster")
+    print(f"\nStatistical Significance:")
+    from scipy import stats
+    t_stat, p_value = stats.ttest_ind(orig_times, fft_times)
+    print(f"  T-statistic: {t_stat:.2f}")
+    print(f"  P-value:     {p_value:.4f}")
+    if p_value < 0.05:
+        print(f"  Result:      Statistically significant ✓")
+    else:
+        print(f"  Result:      Not significant")
     
-    print("\n4. Layer Depth vs Speedup:")
-    print("-"*80)
-    layer_groups = {
-        'Early (0-10)': [r for r in results if r['layer'] <= 10],
-        'Middle (11-25)': [r for r in results if 11 <= r['layer'] <= 25],
-        'Late (26-39)': [r for r in results if r['layer'] >= 26]
+    result = {
+        'config': {
+            'layer_start': args.layer_start,
+            'layer_end': args.layer_end,
+            'block_size': args.block_size,
+            'k': args.num_fft_matrices
+        },
+        'original': {
+            'mean_ms': orig_mean,
+            'std_ms': orig_std,
+            'min_ms': float(np.min(orig_times)),
+            'max_ms': float(np.max(orig_times)),
+            'times': [float(t) for t in orig_times]
+        },
+        'fftchain': {
+            'mean_ms': fft_mean,
+            'std_ms': fft_std,
+            'min_ms': float(np.min(fft_times)),
+            'max_ms': float(np.max(fft_times)),
+            'times': [float(t) for t in fft_times]
+        },
+        'speedup': speedup,
+        'compression': compression,
+        'statistical': {
+            't_stat': float(t_stat),
+            'p_value': float(p_value),
+            'significant': p_value < 0.05
+        }
     }
     
-    for group_name, group_results in layer_groups.items():
-        if group_results:
-            speedups = [r['speedup'] for r in group_results]
-            avg = np.mean(speedups)
-            num_faster = sum(1 for s in speedups if s > 1.0)
-            print(f"{group_name:20s}: Avg={avg:4.2f}x | {num_faster}/{len(group_results)} faster")
-    
-    if faster_configs:
-        print("\n5. Recommended Configurations:")
-        print("-"*80)
-        
-        from collections import Counter
-        block_counter = Counter(r['block_size'] for r in faster_configs)
-        k_counter = Counter(r['k'] for r in faster_configs)
-        
-        best_block = block_counter.most_common(1)[0][0]
-        best_k = k_counter.most_common(1)[0][0]
-        
-        print(f"Most successful: block_size={best_block}, K={best_k}")
-        
-        best_overall = max(faster_configs, key=lambda x: x['speedup'])
-        print(f"Best speedup: Layer {best_overall['layer']}, "
-              f"B={best_overall['block_size']}, K={best_overall['k']}, "
-              f"{best_overall['speedup']:.2f}x")
-        
-        best_balance = max(faster_configs, 
-                          key=lambda x: x['speedup'] * np.log(x['compression']))
-        print(f"Best balance: Layer {best_balance['layer']}, "
-              f"B={best_balance['block_size']}, K={best_balance['k']}, "
-              f"{best_balance['speedup']:.2f}x speedup, {best_balance['compression']:.0f}x compression")
-
-def main():
-    args = get_args()
-    
-    print(f"\nDevice: {args.device}")
-    print(f"Model: {args.model_path}")
-    
-    results = quick_explore(args)
-    
-    analyze_results(results)
-    
-    output_file = 'quick_threshold_results.json'
+    output_file = f'realistic_test_L{args.layer_start}-{args.layer_end}_B{args.block_size}_K{args.num_fft_matrices}.json'
     with open(output_file, 'w') as f:
-        json.dump(results, f, indent=2, default=str)
-    print(f"\n\nResults saved to: {output_file}")
+        json.dump(result, f, indent=2)
+    
+    print(f"\nDetailed results saved to: {output_file}")
+    
+    print("\n" + "="*80)
 
 if __name__ == '__main__':
-    main()
+    args = get_args()
+    
+    print(f"Device: {args.device}")
+    print(f"Model: {args.model_path}")
+    print(f"Checkpoint dir: {args.checkpoint_dir}")
+    print()
+    
+    try:
+        benchmark_with_trained_checkpoint(args)
+    except Exception as e:
+        print(f"\nError: {e}")
+        import traceback
+        traceback.print_exc()

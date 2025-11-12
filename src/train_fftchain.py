@@ -140,7 +140,7 @@ def train_single_layer(model, layer_idx, all_replaced_layers, args):
     mse_loss = nn.MSELoss()
     kl_loss = nn.KLDivLoss(reduction='batchmean')
     
-    accumulation_steps = 4
+    accumulation_steps = 8
     
     # 早停参数
     best_loss = float('inf')
