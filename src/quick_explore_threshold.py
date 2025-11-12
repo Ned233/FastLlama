@@ -7,6 +7,7 @@ from config_fftchain import get_args
 from utils import replace_linear_with_fftchain, load_checkpoint
 import gc
 import os
+from scipy import stats
 
 def benchmark_with_trained_checkpoint(args):
     """
@@ -186,7 +187,6 @@ def benchmark_with_trained_checkpoint(args):
     print(f"  Compression:  {compression:.0f}x")
     
     print(f"\nStatistical Significance:")
-    from scipy import stats
     t_stat, p_value = stats.ttest_ind(orig_times, fft_times)
     print(f"  T-statistic: {t_stat:.2f}")
     print(f"  P-value:     {p_value:.4f}")
