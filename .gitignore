@@ -1,0 +1,3 @@
+# 忽略 model 目录下的所有内容
+model/
+checkpoints/
