@@ -30,7 +30,7 @@ def get_adaptive_args():
     parser.add_argument('--patience', type=int, default=3)
     parser.add_argument('--min_epochs', type=int, default=5)
     
-    parser.add_argument('--loss_threshold_abs', type=float, default=5.0)
+    parser.add_argument('--loss_threshold_abs', type=float, default=1.5)
     parser.add_argument('--loss_threshold_relative', type=float, default=4.0)
     
     parser.add_argument('--min_delta', type=float, default=0.02,
@@ -165,11 +165,27 @@ def train_layer_with_config(args, layer_idx, all_replaced_layers, K, block_size,
         device_map={"": args.device}
     )
     
-    print(f"Replacing {args.target_matrix} in layers {all_replaced_layers} with K={K}, block_size={block_size}...")
-    replaced_modules = replace_linear_with_fftchain(
-        model, all_replaced_layers, args.target_matrix, 
-        block_size, K
-    )
+    # 分别替换每一层，使用各自的配置
+    replaced_modules = []
+    for layer in all_replaced_layers:
+        if layer == layer_idx:
+            # 当前训练层：使用传入的K和block_size
+            layer_K = K
+            layer_block_size = block_size
+        elif layer in prev_layers_info:
+            # 已训练层：使用之前保存的配置
+            layer_K = prev_layers_info[layer]['K']
+            layer_block_size = prev_layers_info[layer]['block_size']
+        else:
+            # 不应该到这里
+            raise ValueError(f"Layer {layer} not in prev_layers_info and not current layer")
+        
+        print(f"  Replacing Layer {layer} with K={layer_K}, block_size={layer_block_size}")
+        modules = replace_linear_with_fftchain(
+            model, [layer], args.target_matrix, 
+            layer_block_size, layer_K
+        )
+        replaced_modules.extend(modules)
     
     print(f"[Train] Converting {len(replaced_modules)} modules to float32...")
     for module in replaced_modules:
@@ -177,6 +193,7 @@ def train_layer_with_config(args, layer_idx, all_replaced_layers, K, block_size,
         for param in module.parameters():
             param.data = param.data.to(args.device).to(torch.float32)
     
+    # 加载已训练层的checkpoint
     if len(prev_layers_info) > 0:
         print(f"[Train] Loading {len(prev_layers_info)} previous layer checkpoints...")
         for prev_layer_idx, prev_config in prev_layers_info.items():
@@ -185,10 +202,15 @@ def train_layer_with_config(args, layer_idx, all_replaced_layers, K, block_size,
                 f'fftchain_L{prev_layer_idx}_K{prev_config["K"]}_B{prev_config["block_size"]}_{args.target_matrix}_final.pt'
             )
             if os.path.exists(prev_checkpoint):
+                print(f"    Loading Layer {prev_layer_idx} (K={prev_config['K']}, B={prev_config['block_size']})")
                 checkpoint = torch.load(prev_checkpoint, map_location='cpu')
+                # 只加载匹配的层参数
                 model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                # 移动到GPU
                 module_idx = all_replaced_layers.index(prev_layer_idx)
                 replaced_modules[module_idx].to(args.device)
+            else:
+                print(f"    Warning: Checkpoint not found for Layer {prev_layer_idx}")
     
     for param in model.parameters():
         param.requires_grad = False
@@ -236,24 +258,42 @@ def adaptive_train_layer(args, layer_idx, layer_position, total_layers, prev_los
     print(f"Training Layer {layer_idx} ({layer_position}/{total_layers})")
     print(f"{'='*80}")
     
-    K_values = [4, 6, 8]
-    block_sizes = [1024, 512, 256]
-    
-    configs_to_try = [
-        (4, 1024),
-        (6, 1024),
-        (6, 512),
-        (8, 512),
-        (8, 256)
-    ]
+    # 根据层位置选择不同的配置策略
+    # 早期层(0-10)通常更难，需要更多参数
+    if layer_idx <= 10:
+        configs_to_try = [
+            (4, 1024),
+            (6, 1024),
+            (8, 1024),   # 早期层增加更大K值
+            (8, 512),
+            (12, 512),   # 更激进的配置
+            (16, 512),   # 最保守
+        ]
+        print(f"[Adaptive] Using early-layer configs (more capacity)")
+    else:
+        configs_to_try = [
+            (4, 1024),
+            (6, 1024),
+            (6, 512),
+            (8, 512),
+            (8, 256)
+        ]
+        print(f"[Adaptive] Using standard configs")
     
     all_replaced_layers = list(range(args.layer_start, layer_idx + 1))
     
     threshold_abs = args.loss_threshold_abs
     if prev_loss is not None:
-        threshold_rel = prev_loss * args.loss_threshold_relative
-        threshold = max(threshold_abs, threshold_rel)
-        print(f"[Adaptive] Threshold: max({threshold_abs:.2f}, {prev_loss:.2f}*{args.loss_threshold_relative}) = {threshold:.2f}")
+        # 只有当前一层loss合理时才使用相对阈值
+        if prev_loss <= threshold_abs:
+            # 允许略微上升（1.5倍），但不超过绝对阈值
+            threshold_rel = prev_loss * 1.5
+            threshold = min(threshold_abs, threshold_rel)
+            print(f"[Adaptive] Threshold: min({threshold_abs:.2f}, {prev_loss:.2f}*1.5) = {threshold:.2f}")
+        else:
+            # 前一层loss已经很高，维持绝对阈值
+            threshold = threshold_abs
+            print(f"[Adaptive] Threshold: {threshold_abs:.2f} (prev layer loss too high)")
     else:
         threshold = threshold_abs
         print(f"[Adaptive] Threshold: {threshold_abs:.2f} (first layer)")
