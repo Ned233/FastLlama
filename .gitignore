@@ -2,3 +2,4 @@
 model/
 checkpoints/
 __pycache__/
+adaptive_checkpoints/
