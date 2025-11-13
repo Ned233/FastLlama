@@ -33,6 +33,9 @@ def get_adaptive_args():
     parser.add_argument('--loss_threshold_abs', type=float, default=5.0)
     parser.add_argument('--loss_threshold_relative', type=float, default=4.0)
     
+    parser.add_argument('--min_delta', type=float, default=0.02,
+                       help='Minimum loss improvement to reset patience counter')
+    
     return parser.parse_args()
 
 def train_single_layer(model, layer_idx, all_replaced_layers, args, K, block_size):
@@ -114,14 +117,20 @@ def train_single_layer(model, layer_idx, all_replaced_layers, args, K, block_siz
         
         avg_loss = total_loss / len(distill_data)
         
-        if avg_loss < best_loss:
+        # 早停逻辑：必须下降超过min_delta才重置计数器
+        if best_loss - avg_loss > args.min_delta:
             best_loss = avg_loss
             best_epoch = epoch + 1
             no_improve_count = 0
             status = "↓NEW"
         else:
             no_improve_count += 1
-            status = f"×{no_improve_count}"
+            # 仍然更新best_loss（即使改善很小），但不重置计数器
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                status = f"~{no_improve_count}"  # 微小改善
+            else:
+                status = f"×{no_improve_count}"  # 无改善
         
         epoch_pbar.set_postfix({
             'L': f'{avg_loss:.1f}',
@@ -176,7 +185,8 @@ def train_layer_with_config(args, layer_idx, all_replaced_layers, K, block_size,
                 f'fftchain_L{prev_layer_idx}_K{prev_config["K"]}_B{prev_config["block_size"]}_{args.target_matrix}_final.pt'
             )
             if os.path.exists(prev_checkpoint):
-                load_checkpoint(model, None, prev_checkpoint, device='cpu')
+                checkpoint = torch.load(prev_checkpoint, map_location='cpu')
+                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
                 module_idx = all_replaced_layers.index(prev_layer_idx)
                 replaced_modules[module_idx].to(args.device)
     
@@ -342,6 +352,7 @@ def main():
     print(f"Target Matrix:        {args.target_matrix}")
     print(f"Max Epochs:           {args.epochs}")
     print(f"Early Stop Patience:  {args.patience}")
+    print(f"Min Delta (improve):  {args.min_delta}")
     print(f"Loss Threshold (abs): {args.loss_threshold_abs}")
     print(f"Loss Threshold (rel): {args.loss_threshold_relative}x")
     print(f"Checkpoint Dir:       {args.checkpoint_dir}")
