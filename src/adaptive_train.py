@@ -17,7 +17,7 @@ def get_adaptive_args():
     parser.add_argument('--checkpoint_dir', type=str, default='./adaptive_checkpoints')
     parser.add_argument('--device', type=str, default='cuda:2')
     
-    parser.add_argument('--layer_start', type=int, default=19)
+    parser.add_argument('--layer_start', type=int, default=0)
     parser.add_argument('--layer_end', type=int, default=39)
     parser.add_argument('--target_matrix', type=str, default='down_proj',
                        choices=['down_proj', 'up_proj', 'gate_proj'])
@@ -27,14 +27,11 @@ def get_adaptive_args():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--epochs', type=int, default=200)
     
-    parser.add_argument('--patience', type=int, default=20)
-    parser.add_argument('--min_epochs', type=int, default=5)
+    parser.add_argument('--patience', type=int, default=10)
+    parser.add_argument('--min_epochs', type=int, default=15)
     
-    parser.add_argument('--loss_threshold_abs', type=float, default=1.5)
+    parser.add_argument('--loss_threshold_abs', type=float, default=2.0)
     parser.add_argument('--loss_threshold_relative', type=float, default=4.0)
-    
-    parser.add_argument('--min_delta', type=float, default=0.02,
-                       help='Minimum loss improvement to reset patience counter')
     
     return parser.parse_args()
 
@@ -117,20 +114,14 @@ def train_single_layer(model, layer_idx, all_replaced_layers, args, K, block_siz
         
         avg_loss = total_loss / len(distill_data)
         
-        # 早停逻辑：必须下降超过min_delta才重置计数器
-        if best_loss - avg_loss > args.min_delta:
+        if avg_loss < best_loss:
             best_loss = avg_loss
             best_epoch = epoch + 1
             no_improve_count = 0
             status = "↓NEW"
         else:
             no_improve_count += 1
-            # 仍然更新best_loss（即使改善很小），但不重置计数器
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                status = f"~{no_improve_count}"  # 微小改善
-            else:
-                status = f"×{no_improve_count}"  # 无改善
+            status = f"×{no_improve_count}"
         
         epoch_pbar.set_postfix({
             'L': f'{avg_loss:.1f}',
@@ -140,7 +131,7 @@ def train_single_layer(model, layer_idx, all_replaced_layers, args, K, block_siz
         
         if epoch >= args.min_epochs and no_improve_count >= args.patience:
             epoch_pbar.close()
-            print(f"\n[Train] ⚠ Early stop at E{epoch+1} (best: E{best_epoch}, loss: {best_loss:.2f})")
+            print(f"\n[Train] Early stop at E{epoch+1} (best: E{best_epoch}, loss: {best_loss:.2f})")
             
             del optimizer, scheduler, distill_data
             gc.collect()
@@ -149,7 +140,7 @@ def train_single_layer(model, layer_idx, all_replaced_layers, args, K, block_siz
             return best_loss, epoch + 1
     
     epoch_pbar.close()
-    print(f"\n[Train] ✓ Completed {args.epochs} epochs (best: E{best_epoch}, loss: {best_loss:.2f})")
+    print(f"\n[Train] Completed {args.epochs} epochs (best: E{best_epoch}, loss: {best_loss:.2f})")
     
     del optimizer, scheduler, distill_data
     gc.collect()
@@ -165,19 +156,15 @@ def train_layer_with_config(args, layer_idx, all_replaced_layers, K, block_size,
         device_map={"": args.device}
     )
     
-    # 分别替换每一层，使用各自的配置
     replaced_modules = []
     for layer in all_replaced_layers:
         if layer == layer_idx:
-            # 当前训练层：使用传入的K和block_size
             layer_K = K
             layer_block_size = block_size
         elif layer in prev_layers_info:
-            # 已训练层：使用之前保存的配置
             layer_K = prev_layers_info[layer]['K']
             layer_block_size = prev_layers_info[layer]['block_size']
         else:
-            # 不应该到这里
             raise ValueError(f"Layer {layer} not in prev_layers_info and not current layer")
         
         print(f"  Replacing Layer {layer} with K={layer_K}, block_size={layer_block_size}")
@@ -193,7 +180,6 @@ def train_layer_with_config(args, layer_idx, all_replaced_layers, K, block_size,
         for param in module.parameters():
             param.data = param.data.to(args.device).to(torch.float32)
     
-    # 加载已训练层的checkpoint
     if len(prev_layers_info) > 0:
         print(f"[Train] Loading {len(prev_layers_info)} previous layer checkpoints...")
         for prev_layer_idx, prev_config in prev_layers_info.items():
@@ -204,9 +190,7 @@ def train_layer_with_config(args, layer_idx, all_replaced_layers, K, block_size,
             if os.path.exists(prev_checkpoint):
                 print(f"    Loading Layer {prev_layer_idx} (K={prev_config['K']}, B={prev_config['block_size']})")
                 checkpoint = torch.load(prev_checkpoint, map_location='cpu')
-                # 只加载匹配的层参数
                 model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-                # 移动到GPU
                 module_idx = all_replaced_layers.index(prev_layer_idx)
                 replaced_modules[module_idx].to(args.device)
             else:
@@ -258,16 +242,14 @@ def adaptive_train_layer(args, layer_idx, layer_position, total_layers, prev_los
     print(f"Training Layer {layer_idx} ({layer_position}/{total_layers})")
     print(f"{'='*80}")
     
-    # 根据层位置选择不同的配置策略
-    # 早期层(0-10)通常更难，需要更多参数
     if layer_idx <= 10:
         configs_to_try = [
             (4, 1024),
             (6, 1024),
-            (8, 1024),   # 早期层增加更大K值
+            (8, 1024),
             (8, 512),
-            (12, 512),   # 更激进的配置
-            (16, 512),   # 最保守
+            (12, 512),
+            (16, 512),
         ]
         print(f"[Adaptive] Using early-layer configs (more capacity)")
     else:
@@ -284,14 +266,11 @@ def adaptive_train_layer(args, layer_idx, layer_position, total_layers, prev_los
     
     threshold_abs = args.loss_threshold_abs
     if prev_loss is not None:
-        # 只有当前一层loss合理时才使用相对阈值
         if prev_loss <= threshold_abs:
-            # 允许略微上升（1.5倍），但不超过绝对阈值
             threshold_rel = prev_loss * 1.5
             threshold = min(threshold_abs, threshold_rel)
             print(f"[Adaptive] Threshold: min({threshold_abs:.2f}, {prev_loss:.2f}*1.5) = {threshold:.2f}")
         else:
-            # 前一层loss已经很高，维持绝对阈值
             threshold = threshold_abs
             print(f"[Adaptive] Threshold: {threshold_abs:.2f} (prev layer loss too high)")
     else:
@@ -306,10 +285,10 @@ def adaptive_train_layer(args, layer_idx, layer_position, total_layers, prev_los
             args, layer_idx, all_replaced_layers, K, block_size, prev_layers_info
         )
         
-        print(f"\n[Train] ✓ Layer {layer_idx} finished: loss={best_loss:.4f} (K={K}, block_size={block_size})")
+        print(f"\n[Train] Layer {layer_idx} finished: loss={best_loss:.4f} (K={K}, block_size={block_size})")
         
         if best_loss <= threshold:
-            print(f"[Adaptive] ✓ Layer {layer_idx} accepted: loss={best_loss:.4f} <= {threshold:.2f}")
+            print(f"[Adaptive] Layer {layer_idx} accepted: loss={best_loss:.4f} <= {threshold:.2f}")
             if attempt_idx > 0:
                 print(f"[Adaptive] (Accepted after {attempt_idx} adjustment(s))")
             
@@ -321,7 +300,7 @@ def adaptive_train_layer(args, layer_idx, layer_position, total_layers, prev_los
             
             return best_loss, prev_layers_info
         else:
-            print(f"[Adaptive] ✗ Layer {layer_idx} rejected: loss={best_loss:.4f} > {threshold:.2f}")
+            print(f"[Adaptive] Layer {layer_idx} rejected: loss={best_loss:.4f} > {threshold:.2f}")
             
             if attempt_idx < len(configs_to_try) - 1:
                 next_K, next_block_size = configs_to_try[attempt_idx + 1]
@@ -334,7 +313,7 @@ def adaptive_train_layer(args, layer_idx, layer_position, total_layers, prev_los
                 if os.path.exists(old_checkpoint):
                     os.remove(old_checkpoint)
             else:
-                print(f"[Adaptive] ⚠ Warning: All configurations tried, accepting loss={best_loss:.4f}")
+                print(f"[Adaptive] Warning: All configurations tried, accepting loss={best_loss:.4f}")
                 prev_layers_info[layer_idx] = {
                     'K': K,
                     'block_size': block_size,
@@ -371,7 +350,7 @@ def adaptive_train_all_layers(args):
             print(f"[Train] GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved\n")
     
     print(f"\n{'='*80}")
-    print(f"[Train] ✓ All {len(all_layers)} layers trained successfully!")
+    print(f"[Train] All {len(all_layers)} layers trained successfully!")
     print(f"{'='*80}")
     print(f"\nFinal Configuration Summary:")
     print(f"{'-'*80}")
@@ -392,7 +371,6 @@ def main():
     print(f"Target Matrix:        {args.target_matrix}")
     print(f"Max Epochs:           {args.epochs}")
     print(f"Early Stop Patience:  {args.patience}")
-    print(f"Min Delta (improve):  {args.min_delta}")
     print(f"Loss Threshold (abs): {args.loss_threshold_abs}")
     print(f"Loss Threshold (rel): {args.loss_threshold_relative}x")
     print(f"Checkpoint Dir:       {args.checkpoint_dir}")
